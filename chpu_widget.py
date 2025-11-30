@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import pyqtSignal, QObject
-from seller_supp_api import send_work_process  # метод для POST-запроса с USER_CONTEXT
+from seller_supp_api import send_work_process, validate_order  # метод для POST-запроса с USER_CONTEXT
 
 if platform.system() == "Windows":
     import win32api
@@ -120,6 +120,12 @@ class ChpuWidget(QWidget):
         if not text:
             QMessageBox.warning(self, "Ошибка", "Введите номер заказа!")
             return
+        success, message = validate_order(order_number=text, is_employee_prepared_facade=True)
+        if not success:
+            # Валидация не пройдена → выводим сообщение в консоль и прекращаем выполнение
+            self.signals.clear.emit()
+            self.append_console(f"❌ Валидация заказа не пройдена: {message}")
+            return
 
         operation_type = "PENALTY" if self.penalty_checkbox.isChecked() else "EARNING"
         self.signals.console.emit(f"Отправка данных: {text}, операция: {operation_type}")
@@ -150,6 +156,6 @@ class ChpuWidget(QWidget):
             if success:
                 self.signals.console.emit(f"✅ {msg}")
             else:
-                self.signals.console.emit(f"❌ Ошибка при отправке: {msg}")
+                self.signals.console.emit(f"❌ Ошибка при обработке: {msg}")
         except Exception as e:
-            self.signals.console.emit(f"❌ Ошибка при отправке: {e}")
+            self.signals.console.emit(f"❌ Ошибка при обработке: {e}")

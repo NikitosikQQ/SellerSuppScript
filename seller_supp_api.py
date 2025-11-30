@@ -4,7 +4,7 @@ import time
 import requests
 import winsound
 
-HOST = "https://seller-supp.ru"
+HOST = "http://localhost:8080"
 USER_CONTEXT = []  # [{username, token, token_timestamp, workplace}, ...]
 TOKEN_TTL = 12 * 60 * 60  # 12 часов
 
@@ -92,12 +92,65 @@ def remove_user_from_context(username):
     global USER_CONTEXT
     USER_CONTEXT = [u for u in USER_CONTEXT if u["username"] != username]
 
+def validate_order(order_number: str, is_employee_prepared_facade: bool):
+    """
+    Выполняет валидацию заказа.
+    Возвращает (success: bool, message: Optional[str])
+    """
+    if not USER_CONTEXT:
+        return False, "Нет авторизованных пользователей."
+
+    # Берем токен первого авторизованного пользователя (как send_work_process)
+    username = USER_CONTEXT[0]["username"]
+    token = get_cached_token(username)
+    if not token:
+        play_notification_sound()
+        return False, f"Нет токена для пользователя {username}."
+
+    url = f"{HOST}/api/v1/orders/validation"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "orderNumber": order_number,
+        "isEmployeePreparedFacade": is_employee_prepared_facade
+    }
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers, verify=False, timeout=5)
+
+        # Если сервер прислал 200 OK → стандартный json ответ ResultInformationResponse
+        if resp.status_code == 200:
+            data = resp.json()
+
+            message = data.get("message")
+            need_alert = data.get("needAlert")
+
+            # 🔔 Воспроизводим звук, если сервер сказал
+            if need_alert:
+                play_notification_sound()
+                return False, message
+
+            # возвращаем message, если есть, иначе None
+            return True, message if message else None
+
+        else:
+            play_notification_sound()
+            return False, f"Ошибка сервера {resp.status_code}: {resp.text}"
+
+    except Exception as e:
+        play_notification_sound()
+        return False, f"Ошибка запроса: {e}"
+
+
 def send_work_process(order_number: str, operation_type: str):
     """
     Отправка информации о выполненном объеме работы всех авторизованных пользователей.
-    :param order_number: строка из PilaWidget
-    :param operation_type: "EARNING" или "PENALTY"
-    :return: (success: bool, message: str)
+    Обрабатывает ResultInformationResponse:
+      message: str
+      orderWasUpdated: bool
+      needAlert: bool
     """
     if not USER_CONTEXT:
         return False, "Нет авторизованных пользователей для отправки данных."
@@ -130,17 +183,33 @@ def send_work_process(order_number: str, operation_type: str):
 
     try:
         resp = requests.post(url, json=payload, headers=headers, verify=False, timeout=5)
-        if resp.status_code == 200:
-            # ✅ Обработка текстового ответа от сервера
-            response_text = resp.text.strip() if resp.text else ""
-            if response_text:
-                play_notification_sound()
-                return True, f"Данные успешно обработаны. \n⚠️ {response_text}"
-            else:
-                return True, "Данные успешно обработаны"
-        else:
+
+        if resp.status_code != 200:
             play_notification_sound()
             return False, f"Ошибка сервера {resp.status_code}: {resp.text}"
+
+        try:
+            data = resp.json()
+        except:
+            play_notification_sound()
+            return False, "Ошибка: сервер вернул некорректный JSON."
+
+        message = data.get("message")
+        order_was_updated = data.get("orderWasUpdated")
+        need_alert = data.get("needAlert")
+
+        # 1) Если needAlert = true → звук + ошибка
+        if need_alert:
+            play_notification_sound()
+            return False, message or "Неизвестная ошибка"
+
+        # 2) Если needAlert = false и orderWasUpdated = true → успех
+        if order_was_updated:
+            return True, "Данные успешно обработаны"
+
+        # 3) Если needAlert = false и orderWasUpdated = false → ошибка + message
+        return False, message or "Операция не выполнена"
+
     except Exception as e:
         play_notification_sound()
         return False, f"Ошибка запроса: {e}"
@@ -168,6 +237,36 @@ def download_packages(username: str, only_packaging_materials: bool):
             return True, None, resp.content
         elif resp.status_code == 404:
             return False, "⚠️ Готовых к упаковке заказов не найдено", None
+        else:
+            play_notification_sound()
+            return False, f"❌ Ошибка {resp.status_code}: {resp.text}", None
+    except Exception as e:
+        play_notification_sound()
+        return False, f"❌ Ошибка запроса: {e}", None
+
+def download_package_by_order(username: str, order_number: str):
+    """
+    Загружает PDF с этикетками для указанного пользователя.
+    Возвращает (success: bool, message: str, pdf_bytes: Optional[bytes])
+
+    :param username: имя пользователя
+    :param order_number: номер заказа, с которого требуется скачать этикетку
+    """
+    token = get_cached_token(username)
+    if not token:
+        play_notification_sound()
+        return False, "❌ Нет токена. Авторизуйтесь заново.", None
+
+    # ✅ передаём параметр order_number в запрос
+    url = f"{HOST}/api/v1/orders/{order_number}/package"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    try:
+        resp = requests.get(url, headers=headers, verify=False, timeout=120)
+        if resp.status_code == 200:
+            return True, None, resp.content
+        elif resp.status_code == 404:
+            return False, f"⚠️ Заказ не был найден по номеру {order_number}", None
         else:
             play_notification_sound()
             return False, f"❌ Ошибка {resp.status_code}: {resp.text}", None

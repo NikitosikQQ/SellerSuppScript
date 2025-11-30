@@ -2,7 +2,7 @@ import sys, os, tempfile, threading, qrcode, fitz, win32api
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QLineEdit, QTextEdit, QLabel, QMessageBox, QCheckBox
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import QTimer, pyqtSignal, QObject
-from seller_supp_api import send_work_process  # метод для POST-запроса с USER_CONTEXT
+from seller_supp_api import send_work_process, validate_order  # метод для POST-запроса с USER_CONTEXT
 
 
 class WorkerSignals(QObject):
@@ -124,6 +124,15 @@ class PilaWidget(QWidget):
             QMessageBox.warning(self, "Ошибка", "Введите строку для генерации QR-кода!")
             return
 
+            # ---------------- Валидация заказа ----------------
+        success, message = validate_order(order_number=text, is_employee_prepared_facade=True)
+        if not success:
+            # Валидация не пройдена → выводим сообщение в консоль и прекращаем выполнение
+            self.signals.clear.emit()
+            self.append_console(f"❌ Валидация заказа не пройдена: {message}")
+            return
+        # Если success == True → продолжаем выполнение, ничего не выводим
+
         operation_type = "PENALTY" if self.penalty_checkbox.isChecked() else "EARNING"
         self.append_console(f"Генерация QR для: {text}, операция: {operation_type}")
         threading.Thread(target=self.worker_generate_and_print, args=(text, operation_type), daemon=True).start()
@@ -183,7 +192,7 @@ class PilaWidget(QWidget):
             if success:
                 self.signals.message.emit(f"✅ {message}")
             else:
-                self.signals.message.emit(f"❌ Ошибка отправки данных о работе: {message}")
+                self.signals.message.emit(f"❌ {message}")
         except Exception as e:
             self.signals.message.emit(f"❌ Ошибка отправки данных: {e}")
 

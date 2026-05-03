@@ -8,7 +8,7 @@ a = Analysis(
      datas=[
         ('ding.wav', '.'),
     ],
-    hiddenimports=[],
+    hiddenimports=['qrcode'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

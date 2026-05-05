@@ -296,14 +296,23 @@ class UpakovkaMebelWidget(QWidget):
             # === Полный поиск ===
             for page_num, text in enumerate(self.pages_text):
                 filtered_text = [line.strip() for line in text if re.fullmatch(r"[0-9\- ]+", line.strip())]
-                for line in filtered_text:
+                # Ozon иногда разбивает номер заказа на две соседние строки в PDF и/или
+                # вставляет пробел внутри номера. Сначала пробуем склейки соседних строк,
+                # затем сравниваем без пробелов где угодно — покрывает оба случая.
+                joined_pairs = [
+                    filtered_text[i] + filtered_text[i + 1]
+                    for i in range(len(filtered_text) - 1)
+                ]
+                search_lines = filtered_text + joined_pairs
+                query_nospace = query.replace(" ", "").lower()
+                for line in search_lines:
                     clean_line = line.split(" ", 1)[0]
-                    if clean_line.lower() == query.lower():
+                    if clean_line.lower() == query.lower() or line.replace(" ", "").lower() == query_nospace:
                         found_lines.append((page_num, clean_line))
 
             if found_lines:
                 first_page, first_line = found_lines[0]
-                self.signals.message.emit(f"✅ Найдено: {first_line} на стр. {first_page + 1}")
+                self.signals.message.emit(f"✅ Найдено: {query} на стр. {first_page + 1}")
 
                 if operation_type == "PENALTY":
                     self.signals.message.emit("⚠️ Брак — печать пропущена.")
@@ -377,14 +386,23 @@ class UpakovkaMebelWidget(QWidget):
 
             for page_num, text in enumerate(self.single_pages_text):
                 filtered_text = [line.strip() for line in text if re.fullmatch(r"[0-9\- ]+", line.strip())]
-                for line in filtered_text:
+                # Ozon иногда разбивает номер заказа на две соседние строки в PDF и/или
+                # вставляет пробел внутри номера. Сначала пробуем склейки соседних строк,
+                # затем сравниваем без пробелов где угодно — покрывает оба случая.
+                joined_pairs = [
+                    filtered_text[i] + filtered_text[i + 1]
+                    for i in range(len(filtered_text) - 1)
+                ]
+                search_lines = filtered_text + joined_pairs
+                query_nospace = query.replace(" ", "").lower()
+                for line in search_lines:
                     clean_line = line.split(" ", 1)[0]
-                    if clean_line.lower() == query.lower():
+                    if clean_line.lower() == query.lower() or line.replace(" ", "").lower() == query_nospace:
                         found_lines.append((page_num, clean_line))
 
             if found_lines:
                 first_page, first_line = found_lines[0]
-                self.signals.message.emit(f"✅ Найдено: {first_line} на стр. {first_page + 1}")
+                self.signals.message.emit(f"✅ Найдено: {query} на стр. {first_page + 1}")
                 self.signals.message.emit("🖨️ Отправка на печать...")
                 try:
                     temp_pdf = tempfile.mktemp("single_package.pdf")

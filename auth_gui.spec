@@ -7,6 +7,7 @@ a = Analysis(
     binaries=[],
      datas=[
         ('ding.wav', '.'),
+        ('PDFtoPrinter.exe', '.'),
     ],
     hiddenimports=['qrcode'],
     hookspath=[],

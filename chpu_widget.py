@@ -120,16 +120,24 @@ class ChpuWidget(QWidget):
         if not text:
             QMessageBox.warning(self, "Ошибка", "Введите номер заказа!")
             return
-        success, message = validate_order(order_number=text, is_employee_prepared_facade=True)
-        if not success:
-            # Валидация не пройдена → выводим сообщение в консоль и прекращаем выполнение
-            self.signals.clear.emit()
-            self.append_console(f"❌ Валидация заказа не пройдена: {message}")
-            return
 
+        # Чекбокс читаем СЕЙЧАС (на UI): clear_search_input ниже его сбрасывает.
         operation_type = "PENALTY" if self.penalty_checkbox.isChecked() else "EARNING"
+
+        # СРАЗУ освобождаем поле и фокус (синхронно — на UI-потоке), чтобы сканер
+        # принял следующий заказ без потери. Валидация (сеть) + отправка — в поток.
+        # Раньше validate_order висел на UI и при двух пиках подряд второй терялся.
+        self.clear_search_input()
         self.signals.console.emit(f"Отправка данных: {text}, операция: {operation_type}")
-        self.worker_send_request(text, operation_type)
+
+        def _run():
+            success, message = validate_order(order_number=text, is_employee_prepared_facade=True)
+            if not success:
+                self.signals.console.emit(f"❌ Валидация заказа не пройдена: {message}")
+                return
+            self.send_work_process_request(text, operation_type)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def worker_send_request(self, text, operation_type):
         """Запускает поток для отправки запроса"""
@@ -144,7 +152,7 @@ class ChpuWidget(QWidget):
             thread.start()
 
             # Очистка полей после старта потока
-            self.signals.clear.emit()
+            pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
 
         except Exception as e:
             self.signals.console.emit(f"❌ Ошибка при обработке: {e}")

@@ -2,7 +2,12 @@ import sys, os, tempfile, threading, qrcode, fitz, win32api
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QLineEdit, QTextEdit, QLabel, QMessageBox, QCheckBox
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import QTimer, pyqtSignal, QObject
-from seller_supp_api import send_work_process, validate_order  # метод для POST-запроса с USER_CONTEXT
+from seller_supp_api import send_work_process, validate_order, print_pdf  # метод для POST-запроса с USER_CONTEXT
+
+# Сериализация обработки сканов: пики принимаются мгновенно (поле чистится сразу,
+# UI не виснет), но обрабатываются СТРОГО ПО ОДНОМУ. Иначе два потока топчут общий
+# self.temp_pdf/qr_temp.png → можно напечатать QR чужого заказа.
+_SCAN_LOCK = threading.Lock()
 
 
 class WorkerSignals(QObject):
@@ -124,26 +129,36 @@ class PilaWidget(QWidget):
             QMessageBox.warning(self, "Ошибка", "Введите строку для генерации QR-кода!")
             return
 
-            # ---------------- Валидация заказа ----------------
-        success, message = validate_order(order_number=text, is_employee_prepared_facade=True)
-        if not success:
-            # Валидация не пройдена → выводим сообщение в консоль и прекращаем выполнение
-            self.signals.clear.emit()
-            self.append_console(f"❌ Валидация заказа не пройдена: {message}")
-            return
-        # Если success == True → продолжаем выполнение, ничего не выводим
-
+        # Чекбокс читаем СЕЙЧАС (на UI): clear_search_input ниже его сбрасывает.
         operation_type = "PENALTY" if self.penalty_checkbox.isChecked() else "EARNING"
-        self.append_console(f"Генерация QR для: {text}, операция: {operation_type}")
-        threading.Thread(target=self.worker_generate_and_print, args=(text, operation_type), daemon=True).start()
+
+        # СРАЗУ освобождаем поле и фокус (синхронно — мы на UI-потоке), чтобы сканер
+        # принял следующий QR без потери. Валидация (сеть) + генерация + печать —
+        # всё в worker_generate_and_print (поток). Раньше validate_order висел тут,
+        # на UI, и при двух пиках подряд второй ввод терялся.
+        self.clear_search_input()
+        self.signals.message.emit(f"Генерация QR для: {text}, операция: {operation_type}")
+
+        def _run():
+            # Один скан за раз (см. _SCAN_LOCK) — иначе гонка на общем self.temp_pdf.
+            with _SCAN_LOCK:
+                self.worker_generate_and_print(text, operation_type)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def worker_generate_and_print(self, text, operation_type):
         """Фоновая задача по генерации и печати QR"""
         try:
+            # Валидация (сетевой запрос) — в потоке, не на UI: иначе быстрые пики теряются.
+            success, message = validate_order(order_number=text, is_employee_prepared_facade=True)
+            if not success:
+                self.signals.message.emit(f"❌ Валидация заказа не пройдена: {message}")
+                return
+
             if operation_type == "PENALTY":
                 self.signals.message.emit("⚠️ БРАК — печать QR пропущена.")
                 threading.Thread(target=self.send_work_process_request, args=(text, operation_type), daemon=True).start()
-                self.signals.clear.emit()
+                pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
                 return
 
             # Генерация PDF с QR
@@ -166,13 +181,7 @@ class PilaWidget(QWidget):
             self.signals.message.emit(f"PDF с QR создан: {self.temp_pdf}")
             self.signals.message.emit("Отправка на печать...")
 
-            success = False
-            try:
-                result = win32api.ShellExecute(0, "print", self.temp_pdf, None, ".", 0)
-                if result > 32:
-                    success = True
-            except Exception as e:
-                self.signals.message.emit(f"Ошибка при печати: {e}")
+            success = print_pdf(self.temp_pdf)
 
             if success:
                 self.signals.message.emit("✅ Печать выполнена успешно!")
@@ -180,7 +189,7 @@ class PilaWidget(QWidget):
             else:
                 self.signals.message.emit("⚠️ Принтер не найден или недоступен.")
 
-            self.signals.clear.emit()
+            pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
 
         except Exception as e:
             self.signals.message.emit(f"❌ Ошибка генерации QR/PDF: {e}")

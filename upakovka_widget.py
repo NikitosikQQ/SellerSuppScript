@@ -9,14 +9,39 @@ from PyQt5.QtCore import pyqtSignal, QObject
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QLineEdit, QTextEdit,
-    QMessageBox, QLabel, QCheckBox, QHBoxLayout
+    QMessageBox, QLabel, QCheckBox, QHBoxLayout, QApplication
 )
+import time as _time
+
+# Диагностика ввода сканера / смены фокуса (баг потери второго пика, кража фокуса Xprinter).
+# По умолчанию ВЫКЛЮЧЕНА — релизная сборка лог не пишет. Включается переменной окружения
+# SS_SCAN_DEBUG=1: тогда пишет в %TEMP%\scan_debug.log с миллисекундными метками.
+_SCAN_DEBUG = os.environ.get("SS_SCAN_DEBUG") == "1"
+_DBG_PATH = os.path.join(tempfile.gettempdir(), "scan_debug.log")
+
+
+def _dbg(msg):
+    if not _SCAN_DEBUG:
+        return
+    try:
+        with open(_DBG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{_time.strftime('%H:%M:%S')}.{int(_time.time() * 1000) % 1000:03d}  {msg}\n")
+    except Exception:
+        pass
+
+
+_DBG_FOCUS_HOOKED = False
 
 from seller_supp_api import download_packages, send_work_process, USER_CONTEXT, \
-    validate_order, download_package_by_order  # импортируем методы и контекст
+    validate_order, download_package_by_order, print_pdf  # импортируем методы и контекст
 
 if platform.system() == "Windows":
     import win32api
+
+# Сериализация обработки сканов: пики принимаются мгновенно (поле чистится сразу,
+# UI не виснет), но обрабатываются СТРОГО ПО ОДНОМУ. Иначе два потока топчут общее
+# состояние (self.single_doc, фикс. temp-файлы) → можно напечатать чужую этикетку.
+_SCAN_LOCK = threading.Lock()
 
 
 class WorkerSignals(QObject):
@@ -58,6 +83,17 @@ class UpakovkaWidget(QWidget):
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Введите номер заказа...")
         self.search_input.setFont(font)
+        # Диагностика (только при SS_SCAN_DEBUG=1): лог ввода в поле + глобальный лог смены фокуса
+        if _SCAN_DEBUG:
+            self.search_input.textChanged.connect(lambda t: _dbg(f"textChanged: '{t}'"))
+            global _DBG_FOCUS_HOOKED
+            if not _DBG_FOCUS_HOOKED:
+                app = QApplication.instance()
+                if app is not None:
+                    app.focusChanged.connect(
+                        lambda old, new: _dbg(
+                            f"focusChanged: {type(old).__name__ if old else None} -> {type(new).__name__ if new else None}"))
+                    _DBG_FOCUS_HOOKED = True
         self.search_input.setStyleSheet("""
             QLineEdit { border: 2px solid #CCCCCC; border-radius: 10px; padding: 8px; }
             QLineEdit:focus { border: 2px solid #0078D7; }
@@ -248,31 +284,25 @@ class UpakovkaWidget(QWidget):
                 writer.save(temp_pdf)
                 writer.close()
 
-                success = False
-                if platform.system() == "Windows":
-                    result = win32api.ShellExecute(0, "print", temp_pdf, None, ".", 0)
-                    if result > 32:
-                        success = True
-                else:
-                    ret = os.system(f"lp '{temp_pdf}'")
-                    if ret == 0:
-                        success = True
+                success = print_pdf(temp_pdf)
 
                 if success:
                     self.signals.message.emit("✅ Печать выполнена успешно!")
                     self.send_to_server(query, operation_type)
-                    self.signals.clear.emit()
+                    pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
                 else:
                     self.signals.message.emit("⚠️ Принтер не найден или недоступен.")
-                    self.signals.clear.emit()
+                    pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
             except Exception as e:
                 self.signals.message.emit(f"❌ Ошибка при печати: {e}")
-                self.signals.clear.emit()
+                pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
 
         threading.Thread(target=worker, daemon=True).start()
 
     def search_text(self):
-        if not self.download_and_print_checkbox.isChecked():
+        _dbg(f">>> search_text fired, field='{self.search_input.text()}'")  # DEBUG
+        is_download = self.download_and_print_checkbox.isChecked()
+        if not is_download:
             if not self.doc:
                 self.signals.show_warning.emit("Ошибка", "Сначала получите PDF с сервера!")
                 return
@@ -282,17 +312,17 @@ class UpakovkaWidget(QWidget):
             self.signals.show_warning.emit("Ошибка", "Введите строку для поиска!")
             return
 
-        success, message = validate_order(order_number=query,
-                                          is_employee_prepared_facade=self.facade_checkbox.isChecked())
-        if not success:
-            # Валидация не пройдена → выводим сообщение в консоль и прекращаем выполнение
-            self.signals.clear.emit()
-            self.append_console(f"❌ Валидация заказа не пройдена: {message}")
-            return
+        # Состояния чекбоксов читаем СЕЙЧАС, на UI-потоке: clear_search_input ниже
+        # их сбрасывает, а Qt-виджеты нельзя трогать из фонового потока.
+        is_facade = self.facade_checkbox.isChecked()
+        operation_type = "PENALTY" if self.penalty_checkbox.isChecked() else "EARNING"
 
-        if not self.download_and_print_checkbox.isChecked():
-            operation_type = "PENALTY" if self.penalty_checkbox.isChecked() else "EARNING"
-            self.signals.message.emit(f"🔍 Поиск {query} ... (тип операции: {operation_type})")
+        # СРАЗУ освобождаем поле и возвращаем фокус (синхронно — мы на UI-потоке).
+        # Сканер примет следующий QR без потери, пока этот обрабатывается в фоне:
+        # валидация (сеть) + поиск по PDF + печать — всё уходит в поток dispatch().
+        # Раньше validate_order висел тут, на UI, и при двух пиках подряд второй ввод
+        # терялся, т.к. интерфейс замирал на сетевой запрос.
+        self.clear_search_input()
 
         def worker():
             found_lines = []
@@ -317,10 +347,14 @@ class UpakovkaWidget(QWidget):
                 first_page, first_line = found_lines[0]
                 self.signals.message.emit(f"✅ Найдено: {query} на стр. {first_page + 1}")
 
+                # Освобождаем поле и возвращаем фокус ДО запуска печати,
+                # чтобы сканер мог сразу принимать следующий QR без потери ввода.
+                # Печать дальше идёт в отдельном thread — она не должна держать UI.
+                pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
+
                 if operation_type == "PENALTY":
                     self.signals.message.emit("⚠️ Брак — печать пропущена.")
                     self.send_to_server(query, operation_type)
-                    self.signals.clear.emit()
                 else:
                     self.signals.message.emit("🖨️ Отправка на печать...")
                     self.print_page(first_page, query, operation_type)
@@ -344,17 +378,18 @@ class UpakovkaWidget(QWidget):
                                 self.signals.message.emit(
                                     f"✅ Найдено (частичный поиск): {query} на стр. {page_num + 1}"
                                 )
+                                # Освобождаем поле и возвращаем фокус ДО печати — см. комментарий выше.
+                                pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
                                 if operation_type == "PENALTY":
                                     self.signals.message.emit("⚠️ Брак — печать пропущена.")
                                     self.send_to_server(query, operation_type)
-                                    self.signals.clear.emit()
                                 else:
                                     self.signals.message.emit("🖨️ Отправка на печать...")
                                     self.print_page(page_num, query, operation_type)
                                 return
 
             self.signals.message.emit(f"⚠️ Строка {query} не найдена.")
-            self.signals.clear.emit()
+            pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
 
         def worker_single_package():
             if not USER_CONTEXT:
@@ -367,7 +402,7 @@ class UpakovkaWidget(QWidget):
             success_download, msg, pdf_bytes = download_package_by_order(username, query)
             self.signals.message.emit(msg)
             if not success_download or not pdf_bytes:
-                self.signals.clear.emit()
+                pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
                 return
             try:
                 temp_pdf_path = os.path.join(tempfile.gettempdir(), "single_package.pdf")
@@ -405,6 +440,9 @@ class UpakovkaWidget(QWidget):
             if found_lines:
                 first_page, first_line = found_lines[0]
                 self.signals.message.emit(f"✅ Найдено: {query} на стр. {first_page + 1}")
+                # Освобождаем поле и возвращаем фокус ДО запуска печати,
+                # чтобы сканер сразу принимал следующий QR без потери ввода.
+                pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
                 self.signals.message.emit("🖨️ Отправка на печать...")
                 try:
                     temp_pdf = tempfile.mktemp("single_package.pdf")
@@ -413,25 +451,14 @@ class UpakovkaWidget(QWidget):
                     writer.save(temp_pdf)
                     writer.close()
 
-                    success = False
-                    if platform.system() == "Windows":
-                        result = win32api.ShellExecute(0, "print", temp_pdf, None, ".", 0)
-                        if result > 32:
-                            success = True
-                    else:
-                        ret = os.system(f"lp '{temp_pdf}'")
-                        if ret == 0:
-                            success = True
+                    success = print_pdf(temp_pdf)
 
                     if success:
                         self.signals.message.emit("✅ Печать выполнена успешно!")
-                        self.signals.clear.emit()
                     else:
                         self.signals.message.emit("⚠️ Принтер не найден или недоступен.")
-                        self.signals.clear.emit()
                 except Exception as e:
                     self.signals.message.emit(f"❌ Ошибка при печати: {e}")
-                    self.signals.clear.emit()
                 return
 
             if len(query) > 4:
@@ -452,6 +479,8 @@ class UpakovkaWidget(QWidget):
                                 self.signals.message.emit(
                                     f"✅ Найдено (частичный поиск): {query} на стр. {page_num + 1}"
                                 )
+                                # Освобождаем поле ДО запуска печати — см. комментарий выше.
+                                pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
                                 self.signals.message.emit("🖨️ Отправка на печать...")
                                 try:
                                     temp_pdf = tempfile.mktemp("single_package.pdf")
@@ -460,31 +489,32 @@ class UpakovkaWidget(QWidget):
                                     writer.save(temp_pdf)
                                     writer.close()
 
-                                    success = False
-                                    if platform.system() == "Windows":
-                                        result = win32api.ShellExecute(0, "print", temp_pdf, None, ".", 0)
-                                        if result > 32:
-                                            success = True
-                                    else:
-                                        ret = os.system(f"lp '{temp_pdf}'")
-                                        if ret == 0:
-                                            success = True
+                                    success = print_pdf(temp_pdf)
 
                                     if success:
                                         self.signals.message.emit("✅ Печать выполнена успешно!")
-                                        self.signals.clear.emit()
                                     else:
                                         self.signals.message.emit("⚠️ Принтер не найден или недоступен.")
-                                        self.signals.clear.emit()
                                 except Exception as e:
                                     self.signals.message.emit(f"❌ Ошибка при печати: {e}")
-                                    self.signals.clear.emit()
                                 return
 
             self.signals.message.emit(f"⚠️ Строка {query} не найдена.")
-            self.signals.clear.emit()
+            pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
 
-        if not self.download_and_print_checkbox.isChecked():
-            threading.Thread(target=worker, daemon=True).start()
-        else:
-            threading.Thread(target=worker_single_package, daemon=True).start()
+        def dispatch():
+            # Один скан за раз (см. _SCAN_LOCK) — иначе гонка на общем состоянии.
+            with _SCAN_LOCK:
+                # Валидация (сетевой запрос) — в потоке, не на UI: быстрые пики не теряются.
+                success, message = validate_order(
+                    order_number=query, is_employee_prepared_facade=is_facade)
+                if not success:
+                    self.signals.message.emit(f"❌ Валидация заказа не пройдена: {message}")
+                    return
+                if not is_download:
+                    self.signals.message.emit(f"🔍 Поиск {query} ... (тип операции: {operation_type})")
+                    worker()
+                else:
+                    worker_single_package()
+
+        threading.Thread(target=dispatch, daemon=True).start()

@@ -1,12 +1,132 @@
 import os
 import sys
 import time
+import platform
+import subprocess
+import threading
+import fitz
 import requests
 import winsound
 
 HOST = "https://seller-supp.ru"
 USER_CONTEXT = []  # [{username, token, token_timestamp, workplace}, ...]
 TOKEN_TTL = 12 * 60 * 60  # 12 часов
+
+# Windows: запуск дочернего процесса без мелькающего консольного окна.
+CREATE_NO_WINDOW = 0x08000000
+
+# Сериализация печати: пики из разных потоков (Пила/Упаковка) встают в очередь и
+# печатают строго по одному. Иначе два PDFtoPrinter стартуют одновременно →
+# столкновение на принтере и всплывашка «принтер занят». UI не виснет — каждый
+# пик и так в своём daemon-потоке, ждёт лишь своей очереди на сам момент печати.
+_PRINT_LOCK = threading.Lock()
+
+# Физическая этикетка цеха (мм). Любой исходный PDF (Ozon 75×120, WB 106×79,
+# внутренние любых размеров) ужимается под этот размер. Поменялся сток наклеек —
+# правим только эти две константы и пересобираем.
+LABEL_WIDTH_MM = 58
+LABEL_HEIGHT_MM = 40
+_MM_TO_PT = 72.0 / 25.4  # 1 мм в пунктах PDF
+
+
+def _normalize_to_label(src_path):
+    """Приводит каждую страницу PDF к размеру этикетки LABEL_WIDTH×HEIGHT (мм).
+
+    Вписывает исходную страницу в МАКСИМАЛЬНОМ масштабе (впритык к краям, без
+    полей), выбирая поворот (0° или 90°), дающий больший масштаб (= эффективнее,
+    авто-ориентация как у Adobe — в отличие от Sumatra, которая крутила не в ту
+    сторону). По той стороне, где из-за пропорций остаётся место, контент
+    центрируется. show_pdf_page копирует векторно, без растеризации — QR и текст
+    остаются чёткими при любом DPI принтера. Работает для ЛЮБОГО исходного размера.
+
+    Возвращает путь к новому PDF (страницы ровно = этикетке, печать в actual-size).
+    """
+    target_w = LABEL_WIDTH_MM * _MM_TO_PT
+    target_h = LABEL_HEIGHT_MM * _MM_TO_PT
+    src = fitz.open(src_path)
+    out = fitz.open()
+    try:
+        for pno in range(src.page_count):
+            rect = src[pno].rect
+            sw, sh = rect.width, rect.height
+            # Кандидаты: без поворота (sw×sh) и с поворотом 90° (sh×sw).
+            # Масштаб — максимальный под весь лист этикетки (впритык, без полей).
+            best = None
+            for rot, eff_w, eff_h in ((0, sw, sh), (90, sh, sw)):
+                if eff_w <= 0 or eff_h <= 0:
+                    continue
+                scale = min(target_w / eff_w, target_h / eff_h)
+                if best is None or scale > best[0]:
+                    best = (scale, rot, eff_w, eff_h)
+            scale, rot, eff_w, eff_h = best
+            placed_w, placed_h = eff_w * scale, eff_h * scale
+            # Центрируем — по «упёршейся» стороне поля нет, по другой остаток делится поровну.
+            x0 = (target_w - placed_w) / 2.0
+            y0 = (target_h - placed_h) / 2.0
+            dst = out.new_page(width=target_w, height=target_h)
+            dst.show_pdf_page(
+                fitz.Rect(x0, y0, x0 + placed_w, y0 + placed_h),
+                src, pno, rotate=rot,
+            )
+        norm_path = (src_path[:-4] if src_path.lower().endswith(".pdf") else src_path) + "_label.pdf"
+        out.save(norm_path)
+        return norm_path
+    finally:
+        out.close()
+        src.close()
+
+
+def print_pdf(pdf_path):
+    """Тихая печать PDF этикетки на принтер по умолчанию. True при успехе.
+
+    1) Нормализует страницы под физическую этикетку 58×40 (см. _normalize_to_label):
+       любой исходный размер вписывается с авто-поворотом — заменяет «умную»
+       подгонку Adobe, которая после обновления Acrobat DC (26.001.21563 от
+       18.05.2026) стала показывать окно ридера и копить процессы
+       (wiki/bugs/2026-05-29_packer-print-acrobat-window-opens-after-update).
+    2) Печатает результат через вшитый PDFtoPrinter.exe в actual-size — без окон,
+       без зависимости от установленного PDF-ридера.
+
+    Фолбэки: если нормализация упала — печатаем исходник как есть; если
+    PDFtoPrinter.exe не вшит — старый ShellExecute. Non-Windows: lp.
+    """
+    try:
+        # 1) Нормализация под этикетку (best-effort — при сбое печатаем оригинал).
+        #    Можно делать вне блокировки — это CPU-операция, не трогает принтер.
+        to_print = pdf_path
+        try:
+            to_print = _normalize_to_label(pdf_path)
+        except Exception:
+            to_print = pdf_path
+
+        # 2) Печать — строго по одному заданию за раз (см. _PRINT_LOCK выше).
+        with _PRINT_LOCK:
+            if platform.system() == "Windows":
+                base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+                printer_exe = os.path.join(base_path, "PDFtoPrinter.exe")
+                if os.path.exists(printer_exe):
+                    # /s — тихий режим PDFtoPrinter (без промптов «принтер занят» и т.п.).
+                    # STARTUPINFO + SW_HIDE жёстко прячет любое окно дочернего процесса,
+                    # чтобы печать НЕ перехватывала фокус приложения. Иначе на момент
+                    # печати фокус уходил из окна (QLineEdit -> None) и следующий пик
+                    # сканера летел «в никуда» — терялся (диагностика 2026-05-30, лог фокуса).
+                    si = subprocess.STARTUPINFO()
+                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    si.wShowWindow = subprocess.SW_HIDE
+                    completed = subprocess.run(
+                        [printer_exe, to_print, "/s"],
+                        creationflags=CREATE_NO_WINDOW,
+                        startupinfo=si,
+                        timeout=60,
+                    )
+                    return completed.returncode == 0
+                # Фолбэк на старое поведение, если бинарь не вшит.
+                import win32api
+                return win32api.ShellExecute(0, "print", to_print, None, ".", 0) > 32
+            ret = os.system(f"lp '{to_print}'")
+            return ret == 0
+    except Exception:
+        return False
 
 
 def get_user_context(username):

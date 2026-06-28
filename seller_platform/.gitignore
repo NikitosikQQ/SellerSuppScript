@@ -1,0 +1,12 @@
+# Отдельный venv форка (не общий seller-support .venv)
+.venv/
+# Артефакты PyInstaller
+build/
+dist/
+*.spec.bak
+# Python
+__pycache__/
+*.pyc
+# Временные нормализованные этикетки печати
+*_label.pdf
+sp_single_package*.pdf

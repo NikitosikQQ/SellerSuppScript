@@ -328,6 +328,34 @@ def send_work_process(order_number, operation_type):
         return False, f"Ошибка запроса: {e}"
 
 
+def download_packages(username, only_packaging_materials):
+    """Bulk: PDF со ВСЕМИ этикетками незавершённых заказов (POST /api/v1/orders/packages).
+
+    Возвращает (success, message, pdf_bytes). Используется режимом «Получить актуальные
+    этикетки»: один PDF грузится локально, дальше каждый скан печатает страницу из него
+    без сетевого вызова (привычный цеховой флоу).
+    """
+    token = get_cached_token(username)
+    if not token:
+        play_notification_sound()
+        return False, "❌ Нет токена. Авторизуйтесь заново.", None
+
+    url = f"{HOST}/api/v1/orders/packages?onlyPackagingMaterials={'true' if only_packaging_materials else 'false'}"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        resp = requests.post(url, headers=headers, verify=VERIFY_SSL, timeout=300)
+        if resp.status_code == 200:
+            return True, None, resp.content
+        elif resp.status_code == 404:
+            return False, "⚠️ Готовых к упаковке заказов не найдено", None
+        else:
+            play_notification_sound()
+            return False, f"❌ Ошибка {resp.status_code}: {resp.text}", None
+    except Exception as e:
+        play_notification_sound()
+        return False, f"❌ Ошибка запроса: {e}", None
+
+
 def download_package_by_order(username, order_number):
     """Этикетка одного заказа (GET /api/v1/orders/{n}/package). (success, message, pdf_bytes)."""
     token = get_cached_token(username)

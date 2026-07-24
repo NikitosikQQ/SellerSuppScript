@@ -6,6 +6,7 @@ from PyQt5.QtGui import QFont
 from PyQt5.QtCore import QTimer
 from seller_supp_api import authorize
 from workplaces_choice import WorkplacesChoiceWidget
+from version import APP_TITLE
 
 
 class AuthWidget(QWidget):
@@ -86,7 +87,8 @@ class AuthWidget(QWidget):
 class AuthGUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Система")
+        # Версия в заголовке: цех может назвать сборку, не открывая свойства файла.
+        self.setWindowTitle(APP_TITLE)
         self.setGeometry(200, 200, 550, 500)
         layout = QVBoxLayout()
         self.setLayout(layout)

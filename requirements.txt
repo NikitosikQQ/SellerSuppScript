@@ -1,0 +1,22 @@
+# Зависимости цехового скрипта (auth_gui). Версии зафиксированы.
+#
+# ВАЖНО про qrcode: начиная с 8.x Pillow у него — ОПЦИОНАЛЬНАЯ зависимость
+# (extra "pil"). Обычный `pip install qrcode` НЕ поставит Pillow, и сборка
+# упадёт в цеху с «No module named 'PIL'» при генерации QR. Поэтому здесь
+# указан именно extra-вариант qrcode[pil].
+#
+# Установка окружения с нуля:
+#   py -3.13 -m venv .venv
+#   .venv/Scripts/python.exe -m pip install -r requirements.txt
+#
+# Сборка exe:
+#   .venv/Scripts/python.exe -m PyInstaller auth_gui.spec --noconfirm
+
+PyQt5==5.15.11
+pymupdf==1.27.1
+qrcode[pil]==8.2
+requests==2.32.5
+pywin32==311
+
+# Сборка
+pyinstaller==6.19.0

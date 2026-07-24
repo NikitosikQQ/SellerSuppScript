@@ -9,7 +9,10 @@ a = Analysis(
         ('ding.wav', '.'),
         ('PDFtoPrinter.exe', '.'),
     ],
-    hiddenimports=['qrcode'],
+    # PIL указан явно: qrcode.make() рисует QR через Pillow, но в qrcode>=8 Pillow —
+    # ОПЦИОНАЛЬНАЯ зависимость (extra 'pil'). Если он не попадёт в сборку, цех получает
+    # «Ошибка генерации QR/PDF: No module named 'PIL'» и печать на Пиле встаёт.
+    hiddenimports=['qrcode', 'PIL', 'PIL.Image', 'PIL.ImageDraw'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -24,7 +24,10 @@ import requests
 import winsound
 
 # ---------------------------------------------------------------------------
-# Конфигурация (host / verify_ssl) из config.ini рядом с .exe или main.py.
+# Конфигурация (host / verify_ssl). ДЕФОЛТ ЗАШИТ НА ПРОД (ff.seller-supp.ru) —
+# «голый» .exe без config.ini сразу идёт на бой. Внешний config.ini рядом с .exe/main.py
+# по-прежнему МОЖЕТ переопределить (например, для локальной разработки host=localhost),
+# но НЕ обязателен.
 # ---------------------------------------------------------------------------
 
 def _external_dir():
@@ -42,8 +45,9 @@ def _bundle_dir():
 def _load_config():
     cfg = configparser.ConfigParser()
     path = os.path.join(_external_dir(), "config.ini")
-    host = "http://localhost:8082"
-    verify_ssl = False
+    # Дефолт — ПРОД (зашит в сборку). config.ini рядом с .exe не нужен; если он есть — переопределит.
+    host = "https://ff.seller-supp.ru"
+    verify_ssl = True
     try:
         if cfg.read(path, encoding="utf-8") and cfg.has_section("api"):
             host = cfg.get("api", "host", fallback=host).strip().rstrip("/")

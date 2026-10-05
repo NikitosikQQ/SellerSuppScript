@@ -131,7 +131,7 @@ class KromkaWidget(QWidget):
         self.signals.console.emit(f"Отправка данных: {text}, операция: {operation_type}")
 
         def _run():
-            success, message = validate_order(order_number=text, is_employee_prepared_facade=True)
+            success, message, _label_code = validate_order(order_number=text, is_employee_prepared_facade=True)
             if not success:
                 self.signals.console.emit(f"❌ Валидация заказа не пройдена: {message}")
                 return

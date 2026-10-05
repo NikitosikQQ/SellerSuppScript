@@ -150,7 +150,7 @@ class PilaWidget(QWidget):
         """Фоновая задача по генерации и печати QR"""
         try:
             # Валидация (сетевой запрос) — в потоке, не на UI: иначе быстрые пики теряются.
-            success, message = validate_order(order_number=text, is_employee_prepared_facade=True)
+            success, message, _label_code = validate_order(order_number=text, is_employee_prepared_facade=True)
             if not success:
                 self.signals.message.emit(f"❌ Валидация заказа не пройдена: {message}")
                 return

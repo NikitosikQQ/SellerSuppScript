@@ -9,6 +9,6 @@
 в dist/SS-v<APP_VERSION>.exe.
 """
 
-APP_VERSION = "26.7.24"
+APP_VERSION = "26.10.5"
 
 APP_TITLE = f"Seller Script - v{APP_VERSION}"

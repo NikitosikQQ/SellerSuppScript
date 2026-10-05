@@ -225,16 +225,20 @@ def remove_user_from_context(username):
 def validate_order(order_number: str, is_employee_prepared_facade: bool):
     """
     Выполняет валидацию заказа.
-    Возвращает (success: bool, message: Optional[str])
+    Возвращает (success: bool, message: Optional[str], label_code: Optional[str]).
+
+    label_code — код с этикетки маркетплейса (у OZON — scanit, «ii…»), по которому ищется
+    страница в PDF: с 05.10.2026 на новой этикетке OZON нет номера отправления. None — кода
+    нет (WB, ЯМ, старый макет, сервер старой версии), страница ищется по номеру.
     """
     if not USER_CONTEXT:
-        return False, "Нет авторизованных пользователей."
+        return False, "Нет авторизованных пользователей.", None
 
     username = USER_CONTEXT[0]["username"]
     token = get_cached_token(username)
     if not token:
         play_notification_sound()
-        return False, f"Нет токена для пользователя {username}."
+        return False, f"Нет токена для пользователя {username}.", None
 
     url = f"{HOST}/api/v1/orders/validation"
     headers = {
@@ -254,20 +258,21 @@ def validate_order(order_number: str, is_employee_prepared_facade: bool):
 
             message = data.get("message")
             need_alert = data.get("needAlert")
+            label_code = data.get("labelCode")
 
             if need_alert:
                 play_notification_sound()
-                return False, message
+                return False, message, None
 
-            return True, message if message else None
+            return True, (message if message else None), label_code
 
         else:
             play_notification_sound()
-            return False, f"Ошибка сервера {resp.status_code}: {resp.text}"
+            return False, f"Ошибка сервера {resp.status_code}: {resp.text}", None
 
     except Exception as e:
         play_notification_sound()
-        return False, f"Ошибка запроса: {e}"
+        return False, f"Ошибка запроса: {e}", None
 
 
 def send_work_process(order_number: str, operation_type: str):
@@ -344,7 +349,9 @@ def download_packages(username: str, only_packaging_materials: bool):
     headers = {"Authorization": f"Bearer {token}"}
 
     try:
-        resp = requests.post(url, headers=headers, verify=False, timeout=300)
+        # С 05.10.2026 этикетки OZON формируются асинхронно (задание → опрос → файл): сервер
+        # укладывается в ~270 с, здесь запас сверху. Обрыв раньше ответа терял весь PDF.
+        resp = requests.post(url, headers=headers, verify=False, timeout=420)
         if resp.status_code == 200:
             return True, None, resp.content
         elif resp.status_code == 404:
@@ -367,7 +374,8 @@ def download_package_by_order(username: str, order_number: str):
     headers = {"Authorization": f"Bearer {token}"}
 
     try:
-        resp = requests.get(url, headers=headers, verify=False, timeout=120)
+        # Этикетка одного заказа тоже через асинхронное задание OZON — запас сверху.
+        resp = requests.get(url, headers=headers, verify=False, timeout=180)
         if resp.status_code == 200:
             return True, None, resp.content
         elif resp.status_code == 404:

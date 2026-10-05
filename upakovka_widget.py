@@ -1,6 +1,5 @@
 import os
 import platform
-import re
 import tempfile
 import threading
 
@@ -33,7 +32,9 @@ def _dbg(msg):
 _DBG_FOCUS_HOOKED = False
 
 from seller_supp_api import download_packages, send_work_process, USER_CONTEXT, \
-    validate_order, download_package_by_order, print_pdf  # импортируем методы и контекст
+    validate_order, download_package_by_order, print_pdf, play_notification_sound  # методы и контекст
+from label_lookup import AMBIGUOUS_CODE, build_code_index, resolve_page, resolve_single_order_page, \
+    result_message
 
 if platform.system() == "Windows":
     import win32api
@@ -211,6 +212,8 @@ class UpakovkaWidget(QWidget):
         self.setLayout(self.layout)
         self.doc = None
         self.pages_text = None
+        # Код этикетки (OZON scanit «ii…») → страницы PDF; строится при загрузке PDF.
+        self.code_index = {}
 
         self.single_doc = None
         self.single_pages_text = None
@@ -254,13 +257,19 @@ class UpakovkaWidget(QWidget):
                 with open(temp_pdf_path, "wb") as f:
                     f.write(pdf_bytes)
 
-                self.doc = fitz.open(temp_pdf_path)
-                self.pages_text = [
-                    self.doc[page].get_text("text").splitlines()
-                    for page in range(len(self.doc))
+                doc = fitz.open(temp_pdf_path)
+                pages_text = [
+                    doc[page].get_text("text").splitlines()
+                    for page in range(len(doc))
                 ]
+                code_index = build_code_index(pages_text)
+                # Подмена документа — под тем же замком, что и обработка скана: иначе скан
+                # мог найти страницу в одном PDF, а напечатать её из другого (чужая этикетка).
+                with _SCAN_LOCK:
+                    self.doc, self.pages_text, self.code_index = doc, pages_text, code_index
                 self.signals.set_path.emit(temp_pdf_path)
-                self.signals.message.emit(f"✅ PDF загружен ({len(self.doc)} страниц).")
+                self.signals.message.emit(
+                    f"✅ PDF загружен ({len(doc)} страниц, кодов этикеток OZON: {len(code_index)}).")
             except Exception as e:
                 self.signals.message.emit(f"❌ Ошибка обработки PDF: {e}")
 
@@ -275,12 +284,16 @@ class UpakovkaWidget(QWidget):
                 self.signals.message.emit(f"❌ Ошибка при обработке: {msg}")
         threading.Thread(target=sender, daemon=True).start()
 
-    def print_page(self, page_num, query, operation_type):
+    def print_page(self, page_num, query, operation_type, doc=None):
+        # doc — документ, в котором искали страницу: печать идёт в своём потоке, и за это
+        # время «Получить актуальные этикетки» может подменить self.doc.
+        source = doc if doc is not None else self.doc
+
         def worker():
             try:
                 temp_pdf = tempfile.mktemp("packages.pdf")
                 writer = fitz.open()
-                writer.insert_pdf(self.doc, from_page=page_num, to_page=page_num)
+                writer.insert_pdf(source, from_page=page_num, to_page=page_num)
                 writer.save(temp_pdf)
                 writer.close()
 
@@ -324,74 +337,24 @@ class UpakovkaWidget(QWidget):
         # терялся, т.к. интерфейс замирал на сетевой запрос.
         self.clear_search_input()
 
-        def worker():
-            found_lines = []
-
-            for page_num, text in enumerate(self.pages_text):
-                filtered_text = [line.strip() for line in text if re.fullmatch(r"[0-9\- ]+", line.strip())]
-                # Ozon иногда разбивает номер заказа на две соседние строки в PDF и/или
-                # вставляет пробел внутри номера. Сначала пробуем склейки соседних строк,
-                # затем сравниваем без пробелов где угодно — покрывает оба случая.
-                joined_pairs = [
-                    filtered_text[i] + filtered_text[i + 1]
-                    for i in range(len(filtered_text) - 1)
-                ]
-                search_lines = filtered_text + joined_pairs
-                query_nospace = query.replace(" ", "").lower()
-                for line in search_lines:
-                    clean_line = line.split(" ", 1)[0]
-                    if clean_line.lower() == query.lower() or line.replace(" ", "").lower() == query_nospace:
-                        found_lines.append((page_num, clean_line))
-
-            if found_lines:
-                first_page, first_line = found_lines[0]
-                self.signals.message.emit(f"✅ Найдено: {query} на стр. {first_page + 1}")
-
-                # Освобождаем поле и возвращаем фокус ДО запуска печати,
-                # чтобы сканер мог сразу принимать следующий QR без потери ввода.
-                # Печать дальше идёт в отдельном thread — она не должна держать UI.
-                pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
-
-                if operation_type == "PENALTY":
-                    self.signals.message.emit("⚠️ Брак — печать пропущена.")
-                    self.send_to_server(query, operation_type)
-                else:
-                    self.signals.message.emit("🖨️ Отправка на печать...")
-                    self.print_page(first_page, query, operation_type)
+        def worker(label_code):
+            # Снимок под _SCAN_LOCK (dispatch держит замок): поиск и печать — по одному PDF.
+            doc, pages_text, code_index = self.doc, self.pages_text, self.code_index
+            page, how = resolve_page(pages_text, code_index, query, label_code)
+            self.signals.message.emit(result_message(how, query, label_code, page))
+            if page is None:
+                if how == AMBIGUOUS_CODE:
+                    play_notification_sound()
                 return
 
-            if len(query) > 4:
-                saved_suffix = query[-4:]
-                short_query = query[:-4]
-                potential_labels = []
-                for page_num, text in enumerate(self.pages_text):
-                    for line in text:
-                        if short_query.lower() in line.lower():
-                            potential_labels.append((page_num, line.strip()))
+            if operation_type == "PENALTY":
+                self.signals.message.emit("⚠️ Брак — печать пропущена.")
+                self.send_to_server(query, operation_type)
+            else:
+                self.signals.message.emit("🖨️ Отправка на печать...")
+                self.print_page(page, query, operation_type, doc)
 
-                if potential_labels:
-                    pages_with_short_query = set(page_num for page_num, _ in potential_labels)
-                    for page_num in pages_with_short_query:
-                        for fragment in " ".join(self.pages_text[page_num]).split():
-                            frag_clean = fragment.strip()
-                            if len(frag_clean) == 4 and frag_clean.lower() == saved_suffix.lower():
-                                self.signals.message.emit(
-                                    f"✅ Найдено (частичный поиск): {query} на стр. {page_num + 1}"
-                                )
-                                # Освобождаем поле и возвращаем фокус ДО печати — см. комментарий выше.
-                                pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
-                                if operation_type == "PENALTY":
-                                    self.signals.message.emit("⚠️ Брак — печать пропущена.")
-                                    self.send_to_server(query, operation_type)
-                                else:
-                                    self.signals.message.emit("🖨️ Отправка на печать...")
-                                    self.print_page(page_num, query, operation_type)
-                                return
-
-            self.signals.message.emit(f"⚠️ Строка {query} не найдена.")
-            pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
-
-        def worker_single_package():
+        def worker_single_package(label_code):
             if not USER_CONTEXT:
                 self.signals.show_warning.emit("Ошибка", "Нет авторизованных пользователей!")
                 return
@@ -402,7 +365,6 @@ class UpakovkaWidget(QWidget):
             success_download, msg, pdf_bytes = download_package_by_order(username, query)
             self.signals.message.emit(msg)
             if not success_download or not pdf_bytes:
-                pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
                 return
             try:
                 temp_pdf_path = os.path.join(tempfile.gettempdir(), "single_package.pdf")
@@ -419,102 +381,45 @@ class UpakovkaWidget(QWidget):
                 self.signals.message.emit(f"❌ Ошибка обработки PDF для заказа {query}: {e}")
                 return
 
-            found_lines = []
-
-            for page_num, text in enumerate(self.single_pages_text):
-                filtered_text = [line.strip() for line in text if re.fullmatch(r"[0-9\- ]+", line.strip())]
-                # Ozon иногда разбивает номер заказа на две соседние строки в PDF и/или
-                # вставляет пробел внутри номера. Сначала пробуем склейки соседних строк,
-                # затем сравниваем без пробелов где угодно — покрывает оба случая.
-                joined_pairs = [
-                    filtered_text[i] + filtered_text[i + 1]
-                    for i in range(len(filtered_text) - 1)
-                ]
-                search_lines = filtered_text + joined_pairs
-                query_nospace = query.replace(" ", "").lower()
-                for line in search_lines:
-                    clean_line = line.split(" ", 1)[0]
-                    if clean_line.lower() == query.lower() or line.replace(" ", "").lower() == query_nospace:
-                        found_lines.append((page_num, clean_line))
-
-            if found_lines:
-                first_page, first_line = found_lines[0]
-                self.signals.message.emit(f"✅ Найдено: {query} на стр. {first_page + 1}")
-                # Освобождаем поле и возвращаем фокус ДО запуска печати,
-                # чтобы сканер сразу принимал следующий QR без потери ввода.
-                pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
-                self.signals.message.emit("🖨️ Отправка на печать...")
-                try:
-                    temp_pdf = tempfile.mktemp("single_package.pdf")
-                    writer = fitz.open()
-                    writer.insert_pdf(self.single_doc, from_page=first_page, to_page=first_page)
-                    writer.save(temp_pdf)
-                    writer.close()
-
-                    success = print_pdf(temp_pdf)
-
-                    if success:
-                        self.signals.message.emit("✅ Печать выполнена успешно!")
-                    else:
-                        self.signals.message.emit("⚠️ Принтер не найден или недоступен.")
-                except Exception as e:
-                    self.signals.message.emit(f"❌ Ошибка при печати: {e}")
+            page, how = resolve_single_order_page(self.single_pages_text, query, label_code)
+            self.signals.message.emit(result_message(how, query, label_code, page))
+            if page is None:
+                if how == AMBIGUOUS_CODE:
+                    play_notification_sound()
                 return
 
-            if len(query) > 4:
-                saved_suffix = query[-4:]
-                short_query = query[:-4]
-                potential_labels = []
-                for page_num, text in enumerate(self.single_pages_text):
-                    for line in text:
-                        if short_query.lower() in line.lower():
-                            potential_labels.append((page_num, line.strip()))
+            # Печать без отправки выработки — как и прежде в этом режиме.
+            self.signals.message.emit("🖨️ Отправка на печать...")
+            try:
+                temp_pdf = tempfile.mktemp("single_package.pdf")
+                writer = fitz.open()
+                writer.insert_pdf(self.single_doc, from_page=page, to_page=page)
+                writer.save(temp_pdf)
+                writer.close()
 
-                if potential_labels:
-                    pages_with_short_query = set(page_num for page_num, _ in potential_labels)
-                    for page_num in pages_with_short_query:
-                        for fragment in " ".join(self.single_pages_text[page_num]).split():
-                            frag_clean = fragment.strip()
-                            if len(frag_clean) == 4 and frag_clean.lower() == saved_suffix.lower():
-                                self.signals.message.emit(
-                                    f"✅ Найдено (частичный поиск): {query} на стр. {page_num + 1}"
-                                )
-                                # Освобождаем поле ДО запуска печати — см. комментарий выше.
-                                pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
-                                self.signals.message.emit("🖨️ Отправка на печать...")
-                                try:
-                                    temp_pdf = tempfile.mktemp("single_package.pdf")
-                                    writer = fitz.open()
-                                    writer.insert_pdf(self.single_doc, from_page=page_num, to_page=page_num)
-                                    writer.save(temp_pdf)
-                                    writer.close()
+                success = print_pdf(temp_pdf)
 
-                                    success = print_pdf(temp_pdf)
-
-                                    if success:
-                                        self.signals.message.emit("✅ Печать выполнена успешно!")
-                                    else:
-                                        self.signals.message.emit("⚠️ Принтер не найден или недоступен.")
-                                except Exception as e:
-                                    self.signals.message.emit(f"❌ Ошибка при печати: {e}")
-                                return
-
-            self.signals.message.emit(f"⚠️ Строка {query} не найдена.")
-            pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
+                if success:
+                    self.signals.message.emit("✅ Печать выполнена успешно!")
+                else:
+                    self.signals.message.emit("⚠️ Принтер не найден или недоступен.")
+            except Exception as e:
+                self.signals.message.emit(f"❌ Ошибка при печати: {e}")
 
         def dispatch():
             # Один скан за раз (см. _SCAN_LOCK) — иначе гонка на общем состоянии.
             with _SCAN_LOCK:
                 # Валидация (сетевой запрос) — в потоке, не на UI: быстрые пики не теряются.
-                success, message = validate_order(
+                # label_code — код с этикетки (OZON scanit «ii…»): по нему ищется страница.
+                success, message, label_code = validate_order(
                     order_number=query, is_employee_prepared_facade=is_facade)
                 if not success:
                     self.signals.message.emit(f"❌ Валидация заказа не пройдена: {message}")
                     return
                 if not is_download:
                     self.signals.message.emit(f"🔍 Поиск {query} ... (тип операции: {operation_type})")
-                    worker()
+                    worker(label_code)
                 else:
-                    worker_single_package()
+                    worker_single_package(label_code)
 
         threading.Thread(target=dispatch, daemon=True).start()

@@ -2,7 +2,7 @@
 
 Форк seller-support-скрипта (`D:\dev\SellerSuppScript`, мебельный цех) под продукт
 **Seller Platform** (только маркетплейсы). Исходный скрипт **не трогается** — этот форк
-живёт в подпапке `seller_platform/` и переиспользует общий `.venv` и бинарь печати.
+живёт в подпапке `seller_platform/` со своим venv (`seller_platform\.venv`) и копией бинаря печати.
 
 ## Что изменилось относительно seller-support-скрипта
 
@@ -24,7 +24,10 @@ seller_platform/
   auth_gui.py                  ← логин → выбор этапа
   workstations_choice.py       ← выбор этапа (my-workstations)
   stage_widget.py              ← скан → валидация → печать → ЗП; «Брак» → PENALTY
+  label_lookup.py              ← поиск страницы этикетки в PDF (без Qt; копия корневого модуля)
   api.py                       ← HTTP-клиент + печать (форк seller_supp_api.py)
+  version.py                   ← версия в заголовке окна (проверка раскатки на посту)
+  tests/                       ← unittest для label_lookup
   config.ini                   ← host / verify_ssl (редактируется на месте)
   PDFtoPrinter.exe, ding.wav   ← ресурсы (копии из корня репо)
   seller-platform-packer.spec  ← сборка PyInstaller
@@ -34,7 +37,7 @@ seller_platform/
 
 ```powershell
 cd D:\dev\SellerSuppScript\seller_platform
-..\.venv\Scripts\python.exe main.py
+.venv\Scripts\python.exe main.py
 ```
 
 Поднятый бэкенд seller-platform на `http://localhost:8082` (см. `config.ini`).
@@ -45,11 +48,21 @@ cd D:\dev\SellerSuppScript\seller_platform
 
 ```powershell
 cd D:\dev\SellerSuppScript\seller_platform
-..\.venv\Scripts\pyinstaller.exe seller-platform-packer.spec
+.venv\Scripts\pyinstaller.exe --noconfirm --clean seller-platform-packer.spec
 ```
 
 Результат: `dist\seller-platform-packer.exe`. Рядом с .exe положить `config.ini`
-(прод-хост, `verify_ssl = true`).
+(прод-хост, `verify_ssl = true`). Перед сборкой поднять `APP_VERSION` в `version.py` — по
+заголовку окна на посту проверяется, что стоит новый exe.
+
+## Тесты
+
+```powershell
+cd D:\dev\SellerSuppScript\seller_platform
+.venv\Scripts\python.exe -m unittest discover -s tests -t . -v
+```
+
+Прогон на реальном PDF этикеток (bulk-PDF FF): `set SS_TEST_PDF=<путь к PDF>` перед командой.
 
 ## Поток упаковщика — два режима печати (как в цеху)
 
@@ -64,8 +77,28 @@ cd D:\dev\SellerSuppScript\seller_platform
    этап → списание склада МП на бэке). Дедуп `canAdvanceTo` защищает от двойной ЗП при перепечатке.
 5. Чекбокс «Брак» → `PENALTY` без печати.
 
-Поиск страницы по номеру переносит проверенную цеховую логику (учёт разрыва Ozon на строки и
-пробелов внутри номера + частичный поиск по 4-символьному хвосту).
+### Поиск страницы в PDF (`label_lookup.py`, с 05.10.2026)
+
+С 05.10.2026 на новой этикетке OZON (отправления с одним товаром) **нет номера отправления** —
+только код экземпляра `scanit` («ii5007026 1081» в тексте, слитно в QR). Сервер отдаёт этот код
+в ответе валидации (`labelCode`), поиск двухступенчатый:
+
+1. **По коду**: индекс «код → страницы» строится при загрузке PDF (в консоли — «PDF загружен
+   (N страниц, кодов этикеток OZON: K)»). Код ровно на одной странице — она
+   («✅ Найдено по коду этикетки …»). На нескольких страницах — **отказ печати со звуком**
+   (чужую этикетку печатать нельзя).
+2. **По номеру** — прежняя цеховая логика (разрыв номера на строки и пробелы + частичный поиск
+   по 4-символьному хвосту): старый макет OZON, WB, ЯМ, а также заказы, у которых кода ещё нет.
+3. Код есть, но в PDF его нет — «нажмите «Получить актуальные этикетки»» (OZON перевыпустил
+   этикетку или PDF загружен до её появления).
+
+В режиме «Скачать и распечатать» PDF по заказу печатается, даже если ни код, ни номер не
+нашлись, — но только если в нём **одна** страница; несколько страниц без совпадения — отказ.
+PDF держится в памяти (файл `sp_packages.pdf` — только копия для поля пути), подмена набора
+идёт под замком скана — скан не напечатает страницу из чужого PDF.
+
+Таймауты скачивания: массовая печать — 420 с, одиночная — 180 с (этикетки OZON формируются
+асинхронно: задание → опрос → файл).
 
 ## Открытые вопросы (см. вики-план)
 

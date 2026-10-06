@@ -8,6 +8,7 @@ from PyQt5.QtGui import QFont
 from PyQt5.QtCore import QTimer
 
 from api import authorize
+from version import APP_TITLE
 from workstations_choice import WorkstationsChoiceWidget
 
 
@@ -91,7 +92,7 @@ class AuthWidget(QWidget):
 class AuthGUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Seller Platform — упаковщик")
+        self.setWindowTitle(APP_TITLE)
         self.setGeometry(200, 200, 550, 500)
         layout = QVBoxLayout()
         self.setLayout(layout)

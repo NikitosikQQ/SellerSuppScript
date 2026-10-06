@@ -3,20 +3,22 @@
 Один виджет вместо пяти furniture-виджетов. Два режима печати этикеток (как в цеху):
 
 1) BULK (основной, кнопка «Получить актуальные этикетки»): один PDF со всеми этикетками
-   незавершённых заказов грузится локально; каждый скан ищет страницу по номеру в этом
-   локальном PDF и печатает её БЕЗ сетевого вызова — быстро на потоке, устойчиво к сети.
+   незавершённых заказов грузится локально; каждый скан ищет в нём страницу и печатает её
+   БЕЗ сетевого вызова за этикеткой — быстро на потоке, устойчиво к сети.
 2) ОДИНОЧНЫЙ (чекбокс «Скачать и распечатать»): этикетка тянется по одному заказу
    (`/orders/{n}/package`) на каждый скан — добор заказа, которого нет в bulk-наборе.
+
+Поиск страницы — label_lookup: сначала по коду этикетки из ответа валидации (labelCode; у
+OZON с 05.10.2026 — scanit «ii…», номера отправления на новой этикетке нет), затем прежний
+поиск по номеру (старый макет OZON, WB, ЯМ). Код на нескольких страницах — отказ печати.
 
 Оба режима при печати начисляют ЗП по stageCode (EARNING); «Брак» → PENALTY без печати.
 Дедуп на бэке (canAdvanceTo) защищает от двойного начисления при перепечатке.
 
 Убрано относительно seller-support: чекбокс «Фасад» (furniture). Сохранено 1:1: _SCAN_LOCK,
-синхронная очистка поля + возврат фокуса (анти-потеря пика), печать в фоне, поиск страницы
-по номеру (учёт разрыва Ozon на строки/пробелы + частичный поиск по 4-символьному хвосту).
+синхронная очистка поля + возврат фокуса (анти-потеря пика), печать в фоне.
 """
 import os
-import re
 import tempfile
 import threading
 
@@ -30,7 +32,11 @@ from PyQt5.QtWidgets import (
 
 from api import (
     USER_CONTEXT, validate_order, send_work_process,
-    download_packages, download_package_by_order, print_pdf,
+    download_packages, download_package_by_order, print_pdf, play_notification_sound,
+)
+from label_lookup import (
+    AMBIGUOUS_CODE, NOT_FOUND, build_code_index, resolve_page, resolve_single_order_page,
+    result_message,
 )
 
 # Один скан за раз — иначе потоки топчут общее состояние и можно напечатать чужую этикетку.
@@ -141,6 +147,8 @@ class StageWidget(QWidget):
         # Bulk-набор (загружается кнопкой) и одиночный (на каждый скан в режиме «Скачать и распечатать»).
         self.doc = None
         self.pages_text = None
+        # Код этикетки (OZON scanit «ii…») → страницы bulk-PDF; строится при загрузке PDF.
+        self.code_index = {}
         self.single_doc = None
         self.single_pages_text = None
 
@@ -178,17 +186,30 @@ class StageWidget(QWidget):
             if not success or not pdf_bytes:
                 return
             try:
+                # Документ — из памяти, а не из файла: файл перезаписывается при каждой загрузке,
+                # а открытый с диска документ MuPDF дочитывает по требованию — и мог бы прочитать
+                # страницы уже из нового PDF. Файл ниже — только копия для поля пути.
+                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                pages_text = [doc[p].get_text("text").splitlines() for p in range(len(doc))]
+                code_index = build_code_index(pages_text)
+                # Подмена набора — под тем же замком, что и обработка скана: иначе скан мог найти
+                # страницу в одном PDF, а напечатать её из другого (чужая этикетка).
+                with _SCAN_LOCK:
+                    self.doc, self.pages_text, self.code_index = doc, pages_text, code_index
+            except Exception as e:
+                self.signals.message.emit(f"❌ Ошибка обработки PDF: {e}")
+                return
+            try:
                 temp_pdf_path = os.path.join(tempfile.gettempdir(), "sp_packages.pdf")
                 with open(temp_pdf_path, "wb") as f:
                     f.write(pdf_bytes)
-                self.doc = fitz.open(temp_pdf_path)
-                self.pages_text = [
-                    self.doc[p].get_text("text").splitlines() for p in range(len(self.doc))
-                ]
                 self.signals.set_path.emit(temp_pdf_path)
-                self.signals.message.emit(f"✅ PDF загружен ({len(self.doc)} страниц). Сканируйте заказы.")
-            except Exception as e:
-                self.signals.message.emit(f"❌ Ошибка обработки PDF: {e}")
+            except OSError as e:
+                # Копия на диске нужна только для поля пути — печать идёт из памяти.
+                self.signals.message.emit(f"ℹ️ Копию PDF на диск сохранить не удалось: {e}")
+            self.signals.message.emit(
+                f"✅ PDF загружен ({len(doc)} страниц, кодов этикеток OZON: {len(code_index)}). "
+                f"Сканируйте заказы.")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -213,7 +234,8 @@ class StageWidget(QWidget):
 
         def dispatch():
             with _SCAN_LOCK:
-                ok, msg = validate_order(query)
+                # label_code — код с этикетки (OZON scanit «ii…»): по нему ищется страница.
+                ok, msg, label_code = validate_order(query)
                 if not ok:
                     self.signals.message.emit(f"❌ Валидация заказа не пройдена: {msg}")
                     return
@@ -227,26 +249,35 @@ class StageWidget(QWidget):
 
                 self.signals.message.emit(f"🔍 Поиск {query} ...")
                 if is_download:
-                    self._single_flow(query)
+                    self._single_flow(query, label_code)
                 else:
-                    self._bulk_flow(query)
+                    self._bulk_flow(query, label_code)
 
         threading.Thread(target=dispatch, daemon=True).start()
 
     # === Режимы EARNING ===
-    def _bulk_flow(self, query):
-        page = self._find_page(self.pages_text, query)
+    def _bulk_flow(self, query, label_code):
+        # Снимок под _SCAN_LOCK (dispatch держит замок): поиск и печать — по одному PDF.
+        doc, pages_text, code_index = self.doc, self.pages_text, self.code_index
+        page, how = resolve_page(pages_text, code_index, query, label_code)
         if page is None:
-            self.signals.message.emit(f"⚠️ Заказ {query} не найден в загруженных этикетках.")
+            if how == NOT_FOUND:
+                # Привычная цеху формулировка; остальные исходы — сообщения label_lookup.
+                self.signals.message.emit(f"⚠️ Заказ {query} не найден в загруженных этикетках.")
+            else:
+                self.signals.message.emit(result_message(how, query, label_code, page))
+            if how == AMBIGUOUS_CODE:
+                play_notification_sound()
             return
-        self.signals.message.emit(f"🖨️ Найдено на стр. {page + 1}. Печать...")
-        if self._extract_and_print(self.doc, page):
+        self.signals.message.emit(result_message(how, query, label_code, page))
+        self.signals.message.emit("🖨️ Печать...")
+        if self._extract_and_print(doc, page):
             self.signals.message.emit("✅ Печать выполнена успешно!")
             self._accrue(query, "EARNING")
         else:
             self.signals.message.emit("⚠️ Принтер не найден или недоступен — ЗП не начислена.")
 
-    def _single_flow(self, query):
+    def _single_flow(self, query, label_code):
         if not USER_CONTEXT:
             self.signals.show_warning.emit("Ошибка", "Нет авторизованных пользователей!")
             return
@@ -257,25 +288,26 @@ class StageWidget(QWidget):
             self.signals.message.emit(f"❌ {msg}")
             return
         try:
-            temp_pdf_path = os.path.join(tempfile.gettempdir(), "sp_single_package.pdf")
-            with open(temp_pdf_path, "wb") as f:
-                f.write(pdf_bytes)
-            self.single_doc = fitz.open(temp_pdf_path)
+            # Из памяти, как и bulk-набор: временный файл здесь не нужен.
+            self.single_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
             self.single_pages_text = [
                 self.single_doc[p].get_text("text").splitlines() for p in range(len(self.single_doc))
             ]
         except Exception as e:
             self.signals.message.emit(f"❌ Ошибка обработки PDF заказа {query}: {e}")
             return
+        if self.single_doc.page_count == 0:
+            self.signals.message.emit(f"⚠️ Пустой PDF этикетки заказа {query}.")
+            return
 
-        # Этикетка по одному заказу обычно одностраничная; всё же ищем страницу по номеру
-        # (на случай нескольких страниц), с фолбэком на первую.
-        page = self._find_page(self.single_pages_text, query)
+        # Сервер отдал PDF только этого заказа: единственная страница печатается, даже если ни
+        # код, ни номер в тексте не нашлись; несколько страниц без совпадения — не гадаем.
+        page, how = resolve_single_order_page(self.single_pages_text, query, label_code)
+        self.signals.message.emit(result_message(how, query, label_code, page))
         if page is None:
-            if self.single_doc.page_count == 0:
-                self.signals.message.emit(f"⚠️ Пустой PDF этикетки заказа {query}.")
-                return
-            page = 0
+            if how == AMBIGUOUS_CODE:
+                play_notification_sound()
+            return
         self.signals.message.emit("🖨️ Печать...")
         if self._extract_and_print(self.single_doc, page):
             self.signals.message.emit("✅ Печать выполнена успешно!")
@@ -295,28 +327,3 @@ class StageWidget(QWidget):
         writer.save(temp)
         writer.close()
         return print_pdf(temp)
-
-    @staticmethod
-    def _find_page(pages_text, query):
-        """Номер страницы заказа в PDF по номеру. Учитывает разрыв Ozon на строки и пробелы
-        внутри номера; фолбэк — частичный поиск по последним 4 символам. None — не найдено."""
-        if not pages_text:
-            return None
-        q_nospace = query.replace(" ", "").lower()
-        for page_num, text in enumerate(pages_text):
-            filtered = [line.strip() for line in text if re.fullmatch(r"[0-9\- ]+", line.strip())]
-            joined = [filtered[i] + filtered[i + 1] for i in range(len(filtered) - 1)]
-            for line in filtered + joined:
-                clean = line.split(" ", 1)[0]
-                if clean.lower() == query.lower() or line.replace(" ", "").lower() == q_nospace:
-                    return page_num
-        if len(query) > 4:
-            suffix = query[-4:]
-            short = query[:-4]
-            for page_num, text in enumerate(pages_text):
-                if any(short.lower() in line.lower() for line in text):
-                    for fragment in " ".join(text).split():
-                        frag = fragment.strip()
-                        if len(frag) == 4 and frag.lower() == suffix.lower():
-                            return page_num
-        return None

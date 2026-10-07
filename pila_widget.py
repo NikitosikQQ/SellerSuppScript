@@ -1,7 +1,8 @@
-import sys, os, tempfile, threading, qrcode, fitz, win32api
+import sys, os, tempfile, threading, time, qrcode, fitz, win32api
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QLineEdit, QTextEdit, QLabel, QMessageBox, QCheckBox
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import QTimer, pyqtSignal, QObject
+import diag
 from seller_supp_api import send_work_process, validate_order, print_pdf  # метод для POST-запроса с USER_CONTEXT
 
 # Сериализация обработки сканов: пики принимаются мгновенно (поле чистится сразу,
@@ -111,6 +112,10 @@ class PilaWidget(QWidget):
 
         self.search_input.returnPressed.connect(self.generate_and_print_qr)
 
+        if diag.ENABLED:
+            diag.log("PILA_OPEN")
+            self.results.append(f"🔎 Отладочная сборка. Лог: {diag.LOG_PATH}")
+
     def append_console(self, text):
         """Вывод сообщений в консоль"""
         self.results.append(text)
@@ -131,6 +136,8 @@ class PilaWidget(QWidget):
 
         # Чекбокс читаем СЕЙЧАС (на UI): clear_search_input ниже его сбрасывает.
         operation_type = "PENALTY" if self.penalty_checkbox.isChecked() else "EARNING"
+        sid = diag.new_scan(order=text, operation=operation_type)
+        t_queued = time.perf_counter()
 
         # СРАЗУ освобождаем поле и фокус (синхронно — мы на UI-потоке), чтобы сканер
         # принял следующий QR без потери. Валидация (сеть) + генерация + печать —
@@ -142,26 +149,35 @@ class PilaWidget(QWidget):
         def _run():
             # Один скан за раз (см. _SCAN_LOCK) — иначе гонка на общем self.temp_pdf.
             with _SCAN_LOCK:
-                self.worker_generate_and_print(text, operation_type)
+                diag.log("SCAN_START", sid=sid, order=text, queue_ms=diag.ms_since(t_queued))
+                self.worker_generate_and_print(text, operation_type, sid)
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def worker_generate_and_print(self, text, operation_type):
+    def worker_generate_and_print(self, text, operation_type, sid=None):
         """Фоновая задача по генерации и печати QR"""
+        t_scan = time.perf_counter()
+        result = "error"
         try:
             # Валидация (сетевой запрос) — в потоке, не на UI: иначе быстрые пики теряются.
-            success, message, _label_code = validate_order(order_number=text, is_employee_prepared_facade=True)
+            t_step = time.perf_counter()
+            with diag.op("validate", sid=sid):
+                success, message, _label_code = validate_order(order_number=text, is_employee_prepared_facade=True)
+            diag.log("SCAN_VALIDATE", sid=sid, order=text, ok=int(success), ms=diag.ms_since(t_step), msg=message)
             if not success:
+                result = "validation_failed"
                 self.signals.message.emit(f"❌ Валидация заказа не пройдена: {message}")
                 return
 
             if operation_type == "PENALTY":
+                result = "penalty"
                 self.signals.message.emit("⚠️ БРАК — печать QR пропущена.")
-                threading.Thread(target=self.send_work_process_request, args=(text, operation_type), daemon=True).start()
+                threading.Thread(target=self.send_work_process_request, args=(text, operation_type, sid), daemon=True).start()
                 pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
                 return
 
             # Генерация PDF с QR
+            t_step = time.perf_counter()
             qr_img = qrcode.make(text)
             width = 38 * 72 / 25.4
             height = 38 * 72 / 25.4
@@ -177,31 +193,44 @@ class PilaWidget(QWidget):
             doc.save(self.temp_pdf)
             doc.close()
             os.remove(img_temp)
+            diag.log("SCAN_QR_PDF", sid=sid, ms=diag.ms_since(t_step))
 
             self.signals.message.emit(f"PDF с QR создан: {self.temp_pdf}")
             self.signals.message.emit("Отправка на печать...")
 
-            success = print_pdf(self.temp_pdf)
+            t_step = time.perf_counter()
+            with diag.op("print", sid=sid, order=text):
+                success = print_pdf(self.temp_pdf)
+            diag.log("SCAN_PRINT", sid=sid, ok=int(success), ms=diag.ms_since(t_step))
 
             if success:
+                result = "printed"
                 self.signals.message.emit("✅ Печать выполнена успешно!")
-                threading.Thread(target=self.send_work_process_request, args=(text, operation_type), daemon=True).start()
+                threading.Thread(target=self.send_work_process_request, args=(text, operation_type, sid), daemon=True).start()
             else:
+                result = "print_failed"
                 self.signals.message.emit("⚠️ Принтер не найден или недоступен.")
 
             pass  # поле уже очищено синхронно в обработчике; повторный clear из потока стирал бы следующий пик
 
         except Exception as e:
+            diag.log("SCAN_ERROR", sid=sid, exc=type(e).__name__, err=e)
             self.signals.message.emit(f"❌ Ошибка генерации QR/PDF: {e}")
+        finally:
+            diag.log("SCAN_DONE", sid=sid, order=text, result=result, total_ms=diag.ms_since(t_scan))
 
-    def send_work_process_request(self, order_number, operation_type):
+    def send_work_process_request(self, order_number, operation_type, sid=None):
         """Отправка данных о работе в API"""
+        t_mark = time.perf_counter()
         try:
-            success, message = send_work_process(order_number, operation_type)
+            with diag.op("mark", sid=sid):
+                success, message = send_work_process(order_number, operation_type)
+            diag.log("SCAN_MARK", sid=sid, order=order_number, ok=int(success), ms=diag.ms_since(t_mark), msg=message)
             if success:
                 self.signals.message.emit(f"✅ {message}")
             else:
                 self.signals.message.emit(f"❌ {message}")
         except Exception as e:
+            diag.log("SCAN_MARK", sid=sid, order=order_number, ok=0, ms=diag.ms_since(t_mark), exc=type(e).__name__, err=e)
             self.signals.message.emit(f"❌ Ошибка отправки данных: {e}")
 

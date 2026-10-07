@@ -8,6 +8,8 @@ import fitz
 import requests
 import winsound
 
+import diag
+
 HOST = "https://seller-supp.ru"
 USER_CONTEXT = []  # [{username, token, token_timestamp, workplace}, ...]
 TOKEN_TTL = 12 * 60 * 60  # 12 часов
@@ -90,17 +92,24 @@ def print_pdf(pdf_path):
     Фолбэки: если нормализация упала — печатаем исходник как есть; если
     PDFtoPrinter.exe не вшит — старый ShellExecute. Non-Windows: lp.
     """
+    t_all = time.perf_counter()
     try:
         # 1) Нормализация под этикетку (best-effort — при сбое печатаем оригинал).
         #    Можно делать вне блокировки — это CPU-операция, не трогает принтер.
         to_print = pdf_path
+        t_norm = time.perf_counter()
         try:
             to_print = _normalize_to_label(pdf_path)
-        except Exception:
+            diag.log("PRINT_NORMALIZE", ms=diag.ms_since(t_norm), ok=1)
+        except Exception as e:
             to_print = pdf_path
+            diag.log("PRINT_NORMALIZE", ms=diag.ms_since(t_norm), ok=0, exc=type(e).__name__, err=e)
 
+        diag.printer_snapshot_async("before_print")
+        t_lock = time.perf_counter()
         # 2) Печать — строго по одному заданию за раз (см. _PRINT_LOCK выше).
         with _PRINT_LOCK:
+            diag.log("PRINT_LOCK", wait_ms=diag.ms_since(t_lock))
             if platform.system() == "Windows":
                 base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
                 printer_exe = os.path.join(base_path, "PDFtoPrinter.exe")
@@ -113,19 +122,34 @@ def print_pdf(pdf_path):
                     si = subprocess.STARTUPINFO()
                     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                     si.wShowWindow = subprocess.SW_HIDE
-                    completed = subprocess.run(
-                        [printer_exe, to_print, "/s"],
-                        creationflags=CREATE_NO_WINDOW,
-                        startupinfo=si,
-                        timeout=60,
-                    )
+                    t_run = time.perf_counter()
+                    diag.mark_print(True)
+                    try:
+                        completed = subprocess.run(
+                            [printer_exe, to_print, "/s"],
+                            creationflags=CREATE_NO_WINDOW,
+                            startupinfo=si,
+                            timeout=60,
+                        )
+                    except subprocess.TimeoutExpired:
+                        diag.log("PRINT_RUN", result="timeout", ms=diag.ms_since(t_run), timeout_s=60)
+                        diag.printer_snapshot_async("after_timeout")
+                        diag.print_processes_async("after_timeout")
+                        raise
+                    finally:
+                        diag.mark_print(False)
+                    diag.log("PRINT_RUN", result="ok" if completed.returncode == 0 else "error",
+                             returncode=completed.returncode, ms=diag.ms_since(t_run))
+                    diag.printer_snapshot_async("after_print")
+                    diag.print_processes_async("after_print", delay_sec=2)
                     return completed.returncode == 0
                 # Фолбэк на старое поведение, если бинарь не вшит.
                 import win32api
                 return win32api.ShellExecute(0, "print", to_print, None, ".", 0) > 32
             ret = os.system(f"lp '{to_print}'")
             return ret == 0
-    except Exception:
+    except Exception as e:
+        diag.log("PRINT_FAIL", ms=diag.ms_since(t_all), exc=type(e).__name__, err=e)
         return False
 
 
@@ -161,13 +185,15 @@ def save_workplace(username, workplace):
     user = get_user_context(username)
     if user:
         user["workplace"] = workplace
+    diag.log("WORKPLACE", user=username, workplace=workplace)
 
 
 def authorize(username, password):
     auth_url = f"{HOST}/auth"
     payload = {"username": username, "password": password}
     try:
-        resp = requests.post(auth_url, json=payload, verify=False, timeout=15)
+        with diag.op("auth", user=username):
+            resp = requests.post(auth_url, json=payload, verify=False, timeout=15)
         if resp.status_code == 200:
             token = resp.json().get("token") or resp.json().get("access_token")
             if token:
@@ -191,7 +217,8 @@ def get_workplaces(username):
     url = f"{HOST}/api/v1/admin/users/{username}/workplaces"
     headers = {"Authorization": f"Bearer {token}"}
     try:
-        resp = requests.get(url, headers=headers, verify=False, timeout=15)
+        with diag.op("workplaces", user=username):
+            resp = requests.get(url, headers=headers, verify=False, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             if isinstance(data, list) and data:
@@ -251,7 +278,8 @@ def validate_order(order_number: str, is_employee_prepared_facade: bool):
     }
 
     try:
-        resp = requests.post(url, json=payload, headers=headers, verify=False, timeout=15)
+        with diag.op("validate", order=order_number):
+            resp = requests.post(url, json=payload, headers=headers, verify=False, timeout=15)
 
         if resp.status_code == 200:
             data = resp.json()
@@ -309,7 +337,8 @@ def send_work_process(order_number: str, operation_type: str):
     }
 
     try:
-        resp = requests.post(url, json=payload, headers=headers, verify=False, timeout=15)
+        with diag.op("mark", order=order_number, operation=operation_type):
+            resp = requests.post(url, json=payload, headers=headers, verify=False, timeout=15)
 
         if resp.status_code != 200:
             play_notification_sound()
@@ -351,7 +380,8 @@ def download_packages(username: str, only_packaging_materials: bool):
     try:
         # С 05.10.2026 этикетки OZON формируются асинхронно (задание → опрос → файл): сервер
         # укладывается в ~270 с, здесь запас сверху. Обрыв раньше ответа терял весь PDF.
-        resp = requests.post(url, headers=headers, verify=False, timeout=420)
+        with diag.op("download_packages"):
+            resp = requests.post(url, headers=headers, verify=False, timeout=420)
         if resp.status_code == 200:
             return True, None, resp.content
         elif resp.status_code == 404:
@@ -375,7 +405,8 @@ def download_package_by_order(username: str, order_number: str):
 
     try:
         # Этикетка одного заказа тоже через асинхронное задание OZON — запас сверху.
-        resp = requests.get(url, headers=headers, verify=False, timeout=180)
+        with diag.op("download_one", order=order_number):
+            resp = requests.get(url, headers=headers, verify=False, timeout=180)
         if resp.status_code == 200:
             return True, None, resp.content
         elif resp.status_code == 404:

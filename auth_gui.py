@@ -4,9 +4,10 @@ from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLineEdit, QPushButton, QLabel
     QApplication
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import QTimer
-from seller_supp_api import authorize
+import diag
+from seller_supp_api import HOST, authorize
 from workplaces_choice import WorkplacesChoiceWidget
-from version import APP_TITLE
+from version import APP_TITLE, APP_VERSION
 
 
 class AuthWidget(QWidget):
@@ -88,7 +89,7 @@ class AuthGUI(QWidget):
     def __init__(self):
         super().__init__()
         # Версия в заголовке: цех может назвать сборку, не открывая свойства файла.
-        self.setWindowTitle(APP_TITLE)
+        self.setWindowTitle(APP_TITLE + (" [DIAG]" if diag.ENABLED else ""))
         self.setGeometry(200, 200, 550, 500)
         layout = QVBoxLayout()
         self.setLayout(layout)
@@ -96,11 +97,29 @@ class AuthGUI(QWidget):
         layout.addWidget(self.stack)
         self.auth_page = AuthWidget(self.stack)
         self.stack.addWidget(self.auth_page)
+        if diag.ENABLED:
+            self.auth_page.append_console(f"🔎 Отладочная сборка. Лог: {diag.LOG_PATH}")
+
+    def closeEvent(self, event):
+        # Отладочная сборка пишет, кто закрывает окно, и не даёт чужому процессу закрыть
+        # его сразу после печати. В обычной сборке should_block_close всегда False.
+        if diag.should_block_close(event.spontaneous()):
+            event.ignore()
+            page = self.stack.currentWidget()
+            if hasattr(page, "append_console"):
+                page.append_console("🔎 Окно закрыли сразу после печати — оставлено открытым (отладка). "
+                                    "Если закрываете вы — нажмите крестик ещё раз.")
+            return
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    diag.init(APP_VERSION, HOST)
     app = QApplication(sys.argv)
+    diag.install_ui_watchdog()
+    app.aboutToQuit.connect(diag.log_exit)
     window = AuthGUI()
     window.show()
+    diag.install_window_watch(app, window)
     sys.exit(app.exec_())

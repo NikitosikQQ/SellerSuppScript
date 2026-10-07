@@ -8,3 +8,7 @@ dist/
 
 # Virtualenv
 .venv/
+
+# Отладочная сборка (auth_gui_diag.spec)
+dist-diag/
+build-diag/

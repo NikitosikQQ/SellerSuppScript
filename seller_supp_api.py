@@ -9,6 +9,7 @@ import requests
 import winsound
 
 import diag
+import settings
 
 HOST = "https://seller-supp.ru"
 USER_CONTEXT = []  # [{username, token, token_timestamp, workplace}, ...]
@@ -22,6 +23,98 @@ CREATE_NO_WINDOW = 0x08000000
 # столкновение на принтере и всплывашка «принтер занят». UI не виснет — каждый
 # пик и так в своём daemon-потоке, ждёт лишь своей очереди на сам момент печати.
 _PRINT_LOCK = threading.Lock()
+
+# Запрет перехвата фокуса на время печати. PDFtoPrinter (AutoIt) на каждую печать дважды
+# запускает PDF-XChange Viewer с видимым окном (@SW_SHOW — наш SW_HIDE до внука не доходит),
+# и окно на ~2 с забирает фокус: скан в это время уходит в просмотрщик и теряется.
+# LockSetForegroundWindow (может вызвать только активный процесс) не даёт чужим окнам стать
+# активными; Windows сама снимает блокировку при клике пользователя или нажатии Alt.
+# Проверено 07.10.2026: с блокировкой окна просмотрщика фокус не забирали ни разу.
+# Снимаем с задержкой: всплывашка драйвера принтера может прийти уже после выхода PDFtoPrinter.
+_LSFW_LOCK, _LSFW_UNLOCK = 1, 2
+FOCUS_LOCK_TAIL_S = 1.5
+_focus_mutex = threading.Lock()
+_focus_unlock_timer = None
+
+
+def _lock_set_foreground_window(code):
+    """LockSetForegroundWindow → (ok, код ошибки Windows). Вынесено отдельно ради тестов."""
+    import ctypes
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    ctypes.set_last_error(0)
+    ok = bool(user32.LockSetForegroundWindow(code))
+    return ok, ctypes.get_last_error()
+
+
+def _focus_lock_begin():
+    global _focus_unlock_timer
+    try:
+        with _focus_mutex:
+            if _focus_unlock_timer is not None:
+                _focus_unlock_timer.cancel()  # предыдущая печать ещё в «хвосте» — продлеваем
+                _focus_unlock_timer = None
+            ok, err = _lock_set_foreground_window(_LSFW_LOCK)
+        diag.log("FOCUS_LOCK", ok=int(ok), err=err)
+    except Exception as e:
+        diag.log("FOCUS_LOCK_FAIL", exc=type(e).__name__, err=e)
+
+
+def _focus_unlock_if_current(timer):
+    """Снять блокировку, только если этот таймер всё ещё текущий. Иначе опоздавший таймер прошлой
+    печати (cancel() пришёл, когда он уже сработал) снял бы блокировку, поставленную новой."""
+    global _focus_unlock_timer
+    try:
+        with _focus_mutex:
+            if _focus_unlock_timer is not timer:
+                return False
+            _focus_unlock_timer = None
+            ok, err = _lock_set_foreground_window(_LSFW_UNLOCK)
+        diag.log("FOCUS_UNLOCK", ok=int(ok), err=err)
+        return True
+    except Exception as e:
+        diag.log("FOCUS_UNLOCK_FAIL", exc=type(e).__name__, err=e)
+        return False
+
+
+def _focus_unlock_later(delay_s=None):
+    global _focus_unlock_timer
+    delay = FOCUS_LOCK_TAIL_S if delay_s is None else delay_s  # константа читается при вызове
+    with _focus_mutex:
+        timer = threading.Timer(delay, _focus_unlock_if_current)
+        timer.args = (timer,)
+        timer.daemon = True
+        _focus_unlock_timer = timer
+        timer.start()
+
+
+def _kill_process_tree(pid):
+    """taskkill /T /F: завершить PDFtoPrinter вместе с PDF-XChange. Иначе зависший просмотрщик
+    переживёт родителя, и PDFtoPrinter (у него защита от второго экземпляра) начнёт валить
+    каждую следующую печать."""
+    try:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], capture_output=True,
+                       creationflags=CREATE_NO_WINDOW, timeout=10)
+    except Exception as e:
+        diag.log("PRINT_KILL_FAIL", pid=pid, exc=type(e).__name__, err=e)
+
+
+def _run_pdftoprinter(args, startupinfo, timeout_s, kill_tree):
+    """Запуск PDFtoPrinter с ожиданием. Код выхода или TimeoutExpired (процесс уже завершён)."""
+    proc = subprocess.Popen(args, creationflags=CREATE_NO_WINDOW, startupinfo=startupinfo)
+    try:
+        return proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        if kill_tree:
+            _kill_process_tree(proc.pid)
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        raise
 
 # Физическая этикетка цеха (мм). Любой исходный PDF (Ozon 75×120, WB 106×79,
 # внутренние любых размеров) ужимается под этот размер. Поменялся сток наклеек —
@@ -122,27 +215,29 @@ def print_pdf(pdf_path):
                     si = subprocess.STARTUPINFO()
                     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                     si.wShowWindow = subprocess.SW_HIDE
+                    timeout_s = settings.get("print", "timeout_s")
+                    focus_lock = settings.get("print", "focus_lock")
                     t_run = time.perf_counter()
                     diag.mark_print(True)
+                    if focus_lock:
+                        _focus_lock_begin()
                     try:
-                        completed = subprocess.run(
-                            [printer_exe, to_print, "/s"],
-                            creationflags=CREATE_NO_WINDOW,
-                            startupinfo=si,
-                            timeout=60,
-                        )
+                        returncode = _run_pdftoprinter([printer_exe, to_print, "/s"], si, timeout_s,
+                                                       settings.get("print", "kill_tree"))
                     except subprocess.TimeoutExpired:
-                        diag.log("PRINT_RUN", result="timeout", ms=diag.ms_since(t_run), timeout_s=60)
+                        diag.log("PRINT_RUN", result="timeout", ms=diag.ms_since(t_run), timeout_s=timeout_s)
                         diag.printer_snapshot_async("after_timeout")
                         diag.print_processes_async("after_timeout")
                         raise
                     finally:
                         diag.mark_print(False)
-                    diag.log("PRINT_RUN", result="ok" if completed.returncode == 0 else "error",
-                             returncode=completed.returncode, ms=diag.ms_since(t_run))
+                        if focus_lock:
+                            _focus_unlock_later()
+                    diag.log("PRINT_RUN", result="ok" if returncode == 0 else "error",
+                             returncode=returncode, ms=diag.ms_since(t_run))
                     diag.printer_snapshot_async("after_print")
                     diag.print_processes_async("after_print", delay_sec=2)
-                    return completed.returncode == 0
+                    return returncode == 0
                 # Фолбэк на старое поведение, если бинарь не вшит.
                 import win32api
                 return win32api.ShellExecute(0, "print", to_print, None, ".", 0) > 32
@@ -249,10 +344,62 @@ def remove_user_from_context(username):
     USER_CONTEXT = [u for u in USER_CONTEXT if u["username"] != username]
 
 
-def validate_order(order_number: str, is_employee_prepared_facade: bool):
+# Сетевые ошибки, при которых имеет смысл повторить запрос: соединение не установилось или ответ
+# не пришёл (в цеху трафик идёт через туннель xkeen, ответы там иногда теряются — 07.10.2026
+# сервер ответил на проверку за 82 мс, а пила ждала 15 с и получила Read timed out).
+_NETWORK_ERRORS = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
+NETWORK_RETRY_PAUSE_S = 0.3
+
+
+def _any_network_error(e):
+    return True
+
+
+def _request_not_sent(e):
+    """Запрос точно не дошёл до сервера: соединение не установилось (таймаут соединения, отказ,
+    DNS). Только такую ОТМЕТКУ безопасно повторять: после отправки первый запрос мог ещё
+    выполняться на сервере, а два параллельных /work/process могут оба начислить — у OrderEntity
+    нет @Version, начисление read-modify-write (ревью 07.10.2026)."""
+    import urllib3.exceptions as ue
+    if isinstance(e, requests.exceptions.ConnectTimeout):
+        return True
+    seen, cause = set(), e
+    while isinstance(cause, BaseException) and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, ue.NewConnectionError):  # отказ, DNS (NameResolutionError — подкласс)
+            return True
+        nxt = getattr(cause, "reason", None)
+        if nxt is None and cause.args and isinstance(cause.args[0], BaseException):
+            nxt = cause.args[0]
+        cause = nxt if nxt is not None else cause.__cause__
+    return False
+
+
+def _post_json(url, payload, headers, timeout, network_retries, op, retry_if=_any_network_error, **op_fields):
+    """POST с повтором при сетевой ошибке, если retry_if(исключение) разрешает. Ответ сервера с
+    ошибкой (4xx/5xx) не повторяется. Возвращает (resp, None, попыток) или (None, исключение, попыток)."""
+    attempts = 1 + max(0, int(network_retries))
+    for attempt in range(1, attempts + 1):
+        try:
+            with diag.op(op, attempt=attempt if attempts > 1 else None, **op_fields):
+                resp = requests.post(url, json=payload, headers=headers, verify=False, timeout=timeout)
+            return resp, None, attempt
+        except _NETWORK_ERRORS as e:
+            if attempt < attempts and retry_if(e):
+                diag.log("NET_RETRY", op=op, attempt=attempt, exc=type(e).__name__)
+                time.sleep(NETWORK_RETRY_PAUSE_S)
+                continue
+            return None, e, attempt
+
+
+def validate_order(order_number: str, is_employee_prepared_facade: bool, timeout=15, network_retries=0):
     """
     Выполняет валидацию заказа.
     Возвращает (success: bool, message: Optional[str], label_code: Optional[str]).
+
+    timeout / network_retries — для пилы: (5, 8) и один повтор при сетевой ошибке (ss_settings.ini,
+    [pila] fast_validate). По умолчанию — как раньше: 15 с без повтора. Повторять проверку безопасно:
+    у WB-заказов сервер опрашивает WB и сохраняет тот же статус — повтор ничего не меняет.
 
     label_code — код с этикетки маркетплейса (у OZON — scanit, «ii…»), по которому ищется
     страница в PDF: с 05.10.2026 на новой этикетке OZON нет номера отправления. None — кода
@@ -278,8 +425,12 @@ def validate_order(order_number: str, is_employee_prepared_facade: bool):
     }
 
     try:
-        with diag.op("validate", order=order_number):
-            resp = requests.post(url, json=payload, headers=headers, verify=False, timeout=15)
+        resp, net_error, attempts = _post_json(url, payload, headers, timeout, network_retries,
+                                               "validate", order=order_number)
+        if net_error is not None:
+            play_notification_sound()
+            tries = f" (попыток: {attempts})" if attempts > 1 else ""
+            return False, f"Ошибка запроса{tries}: {net_error}", None
 
         if resp.status_code == 200:
             data = resp.json()
@@ -303,9 +454,13 @@ def validate_order(order_number: str, is_employee_prepared_facade: bool):
         return False, f"Ошибка запроса: {e}", None
 
 
-def send_work_process(order_number: str, operation_type: str):
+def send_work_process(order_number: str, operation_type: str, network_retries=0):
     """
     Отправка информации о выполненном объеме работы всех авторизованных пользователей.
+
+    network_retries — для пилы один повтор ([pila] mark_retry), но ТОЛЬКО если запрос точно не ушёл
+    (_request_not_sent: соединение не установилось). После отправки не повторяем: первый запрос мог
+    ещё выполняться, и два параллельных могли бы оба начислить. По умолчанию — без повтора, как раньше.
     """
     if not USER_CONTEXT:
         return False, "Нет авторизованных пользователей для отправки данных."
@@ -337,8 +492,13 @@ def send_work_process(order_number: str, operation_type: str):
     }
 
     try:
-        with diag.op("mark", order=order_number, operation=operation_type):
-            resp = requests.post(url, json=payload, headers=headers, verify=False, timeout=15)
+        resp, net_error, attempts = _post_json(url, payload, headers, 15, network_retries, "mark",
+                                               retry_if=_request_not_sent,
+                                               order=order_number, operation=operation_type)
+        if net_error is not None:
+            play_notification_sound()
+            tries = f" (попыток: {attempts})" if attempts > 1 else ""
+            return False, f"Ошибка запроса{tries}: {net_error}"
 
         if resp.status_code != 200:
             play_notification_sound()

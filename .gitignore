@@ -12,3 +12,5 @@ dist/
 # Отладочная сборка (auth_gui_diag.spec)
 dist-diag/
 build-diag/
+dist-release/
+build-release/
